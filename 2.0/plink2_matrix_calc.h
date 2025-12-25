@@ -134,21 +134,22 @@ FLAGSET_DEF_START()
   kfScoreListVariants = (1 << 10),
   kfScoreListVariantsZs = (1 << 11),
   kfScoreMultiInput = (1 << 12),
+  kfScoreSparse = (1 << 13),
 
-  kfScoreQsrHeader = (1 << 13),
-  kfScoreQsrMin = (1 << 14),
+  kfScoreQsrHeader = (1 << 14),
+  kfScoreQsrMin = (1 << 15),
 
-  kfScoreColMaybefid = (1 << 15),
-  kfScoreColFid = (1 << 16),
-  kfScoreColMaybesid = (1 << 17),
-  kfScoreColSid = (1 << 18),
-  kfScoreColPheno1 = (1 << 19),
-  kfScoreColPhenos = (1 << 20),
-  kfScoreColNallele = (1 << 21),
-  kfScoreColDenom = (1 << 22),
-  kfScoreColDosageSum = (1 << 23),
-  kfScoreColScoreAvgs = (1 << 24),
-  kfScoreColScoreSums = (1 << 25),
+  kfScoreColMaybefid = (1 << 16),
+  kfScoreColFid = (1 << 17),
+  kfScoreColMaybesid = (1 << 18),
+  kfScoreColSid = (1 << 19),
+  kfScoreColPheno1 = (1 << 20),
+  kfScoreColPhenos = (1 << 21),
+  kfScoreColNallele = (1 << 22),
+  kfScoreColDenom = (1 << 23),
+  kfScoreColDosageSum = (1 << 24),
+  kfScoreColScoreAvgs = (1 << 25),
+  kfScoreColScoreSums = (1 << 26),
   kfScoreListColDefault = (kfScoreColMaybefid | kfScoreColMaybesid | kfScoreColPhenos | kfScoreColScoreAvgs),
   kfScoreColDefault = (kfScoreListColDefault | kfScoreColNallele | kfScoreColDosageSum),
   kfScoreColAll = ((kfScoreColScoreSums * 2) - kfScoreColMaybefid)
@@ -188,6 +189,11 @@ typedef struct ScoreInfoStruct {
   char* qsr_data_fname;
   uint32_t qsr_varid_col_p1;
   uint32_t qsr_val_col_p1;
+
+  // --score-sparse
+  char* sparse_mtx_fname;
+  char* sparse_snp_fname;
+  char* sparse_score_names_fname;
 } ScoreInfo;
 
 FLAGSET_DEF_START()

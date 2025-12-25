@@ -11520,6 +11520,45 @@ int main(int argc, char** argv) {
           }
           pc.command_flags1 |= kfCommand1Score;
           pc.dependency_flags |= kfFilterAllReq;
+        } else if (strequal_k_unsafe(flagname_p2, "core-sparse")) {
+          if (unlikely(pc.command_flags1 & kfCommand1Score)) {
+            logerrputs("Error: --score-sparse cannot be used with --score/--score-list.\n");
+            goto main_ret_INVALID_CMDLINE;
+          }
+          if (unlikely(EnforceParamCtRange(argvk[arg_idx], param_ct, 3, 12))) {
+            goto main_ret_INVALID_CMDLINE_2A;
+          }
+          reterr = AllocFname(argvk[arg_idx + 1], flagname_p, &pc.score_info.sparse_mtx_fname);
+          if (unlikely(reterr)) {
+            goto main_ret_1;
+          }
+          reterr = AllocFname(argvk[arg_idx + 2], flagname_p, &pc.score_info.sparse_snp_fname);
+          if (unlikely(reterr)) {
+            goto main_ret_1;
+          }
+          reterr = AllocFname(argvk[arg_idx + 3], flagname_p, &pc.score_info.sparse_score_names_fname);
+          if (unlikely(reterr)) {
+            goto main_ret_1;
+          }
+          pc.score_info.flags |= kfScoreSparse;
+          for (uint32_t param_idx = 4; param_idx <= param_ct; ++param_idx) {
+            const char* cur_modif = argvk[arg_idx + param_idx];
+            const uint32_t cur_modif_slen = strlen(cur_modif);
+            if (StrStartsWith(cur_modif, "cols=", cur_modif_slen)) {
+              reterr = ParseColDescriptor(&(cur_modif[5]), "maybefid\0fid\0maybesid\0sid\0pheno1\0phenos\0nallele\0denom\0dosagesum\0scoreavgs\0scoresums\0", "score", kfScoreColMaybefid, kfScoreColDefault, 1, &pc.score_info.flags);
+              if (unlikely(reterr)) {
+                goto main_ret_1;
+              }
+            } else if (strequal_k(cur_modif, "no-mean-imputation", cur_modif_slen)) {
+              pc.score_info.flags |= kfScoreNoMeanimpute;
+            }
+            // Add other modifiers as needed... for now cols= is enough for test.
+          }
+          if (!(pc.score_info.flags & kfScoreColAll)) {
+            pc.score_info.flags |= kfScoreColDefault;
+          }
+          pc.command_flags1 |= kfCommand1Score;
+          pc.dependency_flags |= kfFilterAllReq;
         } else if (strequal_k_unsafe(flagname_p2, "core-col-nums")) {
           if (unlikely(pc.score_info.input_col_idx_range_list.name_ct)) {
             logerrputs("Error: --score-col-nums cannot be used when three numeric arguments are\nprovided to --score.\n");

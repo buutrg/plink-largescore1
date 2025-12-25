@@ -27,12 +27,14 @@
 // referred to as LAPACK_<fname>(), and the integer index type is lapack_int.
 
 #include "include/plink2_base.h"
+#include <cmath>
 
 #ifdef NOLAPACK
 typedef double MatrixInvertBuf1;
 CONSTI32(kMatrixInvertBuf1ElemAlloc, 2 * sizeof(double));
 CONSTI32(kMatrixInvertBuf1CheckedAlloc, 2 * sizeof(double));
 #  define lapack_int int
+#  define BLAS_SET_NUM_THREADS(num)
 
 #else  // not NOLAPACK
 
@@ -346,7 +348,7 @@ HEADER_INLINE double HalfInvertedDet(__maybe_unused const double* half_inverted_
   for (uint32_t uii = 1; uii != dim; ++uii) {
     det_u *= dbl_1d_buf[uii];
   }
-  return fabs(det_u);
+  return std::fabs(det_u);
 }
 
 HEADER_INLINE double HalfSymmInvertedDet(__maybe_unused const double* half_inverted_iter, __maybe_unused const MatrixInvertBuf1* dbl_1d_buf, uint32_t dim, __maybe_unused uint32_t stride) {
