@@ -36,6 +36,17 @@ endif
 BLASFLAGS64	?= -llapack -lf77blas -latlas
 ARCH32		?=
 
+# MKL support (set USE_MKL=1 to enable)
+ifdef USE_MKL
+  MKLROOT = /n/sw/intel-cluster-studio-2019/mkl
+  # Put MKL include first to override any conda MKL
+  CFLAGS := -I$(MKLROOT)/include $(CFLAGS)
+  CXXFLAGS := -I$(MKLROOT)/include -DUSE_MKL $(CXXFLAGS)
+  LDFLAGS := -L$(MKLROOT)/lib/intel64 -Wl,-rpath,$(MKLROOT)/lib/intel64 -lmkl_intel_lp64 -lmkl_sequential -lmkl_core $(LDFLAGS)
+  BLASFLAGS64 = 
+endif
+
+
 # Mandatory flags added to defaults or env settings
 CFLAGS		+= -std=gnu99 $(BASEFLAGS) $(CWARN) $(CINCLUDE)
 CXXFLAGS	+= -std=c++14 $(BASEFLAGS) $(CXXWARN) $(CXXINCLUDE)

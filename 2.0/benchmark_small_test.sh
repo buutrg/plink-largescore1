@@ -7,9 +7,10 @@ set -e
 
 # Configuration
 GENO_DATA="/n/holylfs05/LABS/liang_lab/Lab/btruong/Tools/g1000_eur"
-NUM_SNPS=100000
+NUM_SNPS=6000000
 NUM_SCORES=100
-SPARSITY=0.99
+# 1M non-zero per score out of 6M = 1/6 density = 83.3% sparsity
+SPARSITY=0.8333
 BENCH_DIR="./benchmark_${NUM_SNPS}_snps"
 
 # Use system plink2 for dense scoring (baseline/original version)

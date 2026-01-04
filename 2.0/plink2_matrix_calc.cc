@@ -35,6 +35,18 @@
 #include "plink2_random.h"
 #include "plink2_sparse_tasks.h"
 
+// AVX2 intrinsics for optimized sparse scoring
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+// MKL sparse BLAS for optimized sparse matrix operations
+#ifdef USE_MKL
+#include <mkl.h>
+#include <mkl_spblas.h>
+#endif
+
+
 #ifdef USE_CUDA
 #  include "cuda/plink2_matrix_cuda.h"
 #endif
@@ -7333,21 +7345,31 @@ THREAD_FUNC_DECL CalcScoreThread(void* raw_arg) {
             }
           }
         } else if (ctx->sparse_weight_starts) {
-          // Optimized direct sparse scoring - only process non-zero weights
+          // Optimized sparse scoring with MKL/AVX2
           const uint32_t* sparse_weight_starts = ctx->sparse_weight_starts;
           const uint32_t* sparse_weight_cols = ctx->sparse_weight_cols;
           const double* sparse_weight_vals = ctx->sparse_weight_vals;
           
-          // Simple optimized loop without OpenMP overhead
-          // Process each variant's non-zero weights directly
+          // AVX2 processes 4 doubles at once
+          const uint32_t simd_width = 4;
+          const uint32_t simd_limit = sample_shard_size - (sample_shard_size % simd_width);
+          
           for (uint32_t i = 0; i < dense_variant_ct; ++i) {
             const uint32_t subsetted_vidx = ctx->variant_sidxs[parity][i];
             const uint32_t w_start = sparse_weight_starts[subsetted_vidx];
             const uint32_t w_end = sparse_weight_starts[subsetted_vidx + 1];
             
-            if (w_start == w_end) continue; // Skip variants with no weights
+            if (w_start == w_end) continue;
             
-            const double* cur_dosages = &(dosages_vmaj[i * sample_shard_size]);
+            const double* __restrict__ cur_dosages = &(dosages_vmaj[i * sample_shard_size]);
+            
+            // Prefetch next variant's dosages for better memory performance
+            if (i + 1 < dense_variant_ct) {
+              const uint32_t next_vidx = ctx->variant_sidxs[parity][i + 1];
+              if (sparse_weight_starts[next_vidx] != sparse_weight_starts[next_vidx + 1]) {
+                __builtin_prefetch(&dosages_vmaj[(i + 1) * sample_shard_size], 0, 1);
+              }
+            }
             
             // Process each non-zero weight for this variant
             for (uint32_t k = w_start; k < w_end; ++k) {
@@ -7355,13 +7377,36 @@ THREAD_FUNC_DECL CalcScoreThread(void* raw_arg) {
               const double val = sparse_weight_vals[k];
               double* __restrict__ cur_scores = &(shard_final_scores_cmaj[s_idx * sample_shard_size]);
               
-              // Vectorizable inner loop - compiler should auto-vectorize this
+              // Prefetch next score column
+              if (k + 1 < w_end) {
+                __builtin_prefetch(&shard_final_scores_cmaj[sparse_weight_cols[k + 1] * sample_shard_size], 1, 1);
+              }
+              
+#ifdef USE_MKL
+              // MKL cblas_daxpy: highly optimized y = a*x + y
+              cblas_daxpy(sample_shard_size, val, cur_dosages, 1, cur_scores, 1);
+#elif defined(__AVX2__)
+              // AVX2 SIMD: process 4 doubles at a time with FMA
+              const __m256d val_vec = _mm256_set1_pd(val);
+              uint32_t s = 0;
+              for (; s < simd_limit; s += simd_width) {
+                __m256d doses = _mm256_loadu_pd(&cur_dosages[s]);
+                __m256d scores = _mm256_loadu_pd(&cur_scores[s]);
+                scores = _mm256_fmadd_pd(val_vec, doses, scores);
+                _mm256_storeu_pd(&cur_scores[s], scores);
+              }
+              for (; s < sample_shard_size; ++s) {
+                cur_scores[s] += val * cur_dosages[s];
+              }
+#else
+              // Fallback: compiler auto-vectorization
               #if defined(__GNUC__) || defined(__clang__)
               #pragma GCC ivdep
               #endif
               for (uint32_t s = 0; s < sample_shard_size; ++s) {
                 cur_scores[s] += val * cur_dosages[s];
               }
+#endif
             }
           }
         } else {
