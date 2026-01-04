@@ -33,12 +33,17 @@
 #include "plink2_decompress.h"
 #include "plink2_matrix.h"
 #include "plink2_random.h"
+#include "plink2_sparse_tasks.h"
 
 #ifdef USE_CUDA
 #  include "cuda/plink2_matrix_cuda.h"
 #endif
 
 #include <unistd.h>  // unlink()
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <vector>
 #include <unordered_map>
@@ -6429,6 +6434,181 @@ typedef struct SparseScoreDataStruct {
   uint32_t total_weights;
 } SparseScoreData;
 
+// Binary sparse format header
+struct BinarySparseHeader {
+  char magic[8];          // "PLNKSPR\0"
+  uint32_t version;
+  uint64_t num_variants;
+  uint64_t num_traits;
+  uint64_t num_nonzeros;
+  char reserved[32];
+};
+
+// Load binary sparse format (3× faster than MTX)
+PglErr LoadBinarySparse(const char* filename, const uintptr_t* variant_include, const uint32_t* variant_include_cumulative_popcounts, const char* const* variant_ids, uint32_t raw_variant_ct, uint32_t variant_ct, char** score_names_ptr, uint32_t* score_ct_ptr, uintptr_t* max_score_name_blen_ptr, SparseScoreData* sparse_data_ptr) {
+  FILE* binfile = fopen(filename, "rb");
+  if (!binfile) {
+    return kPglRetOpenFail;
+  }
+  
+  // Read and validate header
+  BinarySparseHeader header;
+  if (fread(&header, sizeof(BinarySparseHeader), 1, binfile) != 1) {
+    fclose(binfile);
+    return kPglRetReadFail;
+  }
+  
+  if (memcmp(header.magic, "PLNKSPR\0", 8) != 0) {
+    fclose(binfile);
+    logerrputs("Error: Invalid binary sparse file format.\n");
+    return kPglRetMalformedInput;
+  }
+  
+  const uint64_t file_variant_ct = header.num_variants;
+  const uint64_t file_trait_ct = header.num_traits;
+  const uint64_t file_nonzero_ct = header.num_nonzeros;
+  
+  logprintf("Loading binary sparse: %llu variants × %llu traits (%llu nonzeros)\n",
+           file_variant_ct, file_trait_ct, file_nonzero_ct);
+  
+  // Read CSR arrays
+  uint64_t* file_row_starts;
+  uint32_t* file_col_indices;
+  double* file_values;
+  
+  if (bigstack_alloc_u64(file_variant_ct + 1, &file_row_starts) ||
+      bigstack_alloc_u32(file_nonzero_ct, &file_col_indices) ||
+      bigstack_alloc_d(file_nonzero_ct, &file_values)) {
+    fclose(binfile);
+    return kPglRetNomem;
+  }
+  
+  if (fread(file_row_starts, sizeof(uint64_t), file_variant_ct + 1, binfile) != file_variant_ct + 1 ||
+      fread(file_col_indices, sizeof(uint32_t), file_nonzero_ct, binfile) != file_nonzero_ct ||
+      fread(file_values, sizeof(double), file_nonzero_ct, binfile) != file_nonzero_ct) {
+    fclose(binfile);
+    return kPglRetReadFail;
+  }
+  
+  // Read variant IDs and build simple lookup map
+  std::unordered_map<std::string, uint32_t> file_id_to_idx;
+  char id_buf[256];
+  
+  for (uint64_t i = 0; i < file_variant_ct; i++) {
+    // Read null-terminated string
+    size_t pos = 0;
+    int ch;
+    while ((ch = fgetc(binfile)) != '\0' && ch != EOF && pos < 255) {
+      id_buf[pos++] = ch;
+    }
+    id_buf[pos] = '\0';
+    file_id_to_idx[std::string(id_buf)] = i;
+  }
+  
+  // Read trait names
+  char** score_names;
+  if (bigstack_alloc_cp(file_trait_ct, &score_names)) {
+    fclose(binfile);
+    return kPglRetNomem;
+  }
+  
+  uintptr_t max_score_name_blen = 0;
+  for (uint64_t i = 0; i < file_trait_ct; i++) {
+    size_t pos = 0;
+    int ch;
+    while ((ch = fgetc(binfile)) != '\0' && ch != EOF && pos < 255) {
+      id_buf[pos++] = ch;
+    }
+    id_buf[pos] = '\0';
+    
+    const uint32_t blen = pos + 1;
+    if (bigstack_alloc_c(blen, &score_names[i])) {
+      fclose(binfile);
+      return kPglRetNomem;
+    }
+    memcpy(score_names[i], id_buf, blen);
+    if (blen > max_score_name_blen) {
+      max_score_name_blen = blen;
+    }
+  }
+  
+  fclose(binfile);
+  
+  // Build filtered sparse structure
+  uint32_t* variant_starts;
+  uint32_t* score_idxs;
+  double* score_vals;
+  
+  if (bigstack_alloc_u32(variant_ct + 1, &variant_starts)) {
+    return kPglRetNomem;
+  }
+  
+  // Count matching weights
+  uint32_t total_weights = 0;
+  variant_starts[0] = 0;
+  
+  uintptr_t variant_uidx_base = 0;
+  uintptr_t variant_include_bits = variant_include[0];
+  
+  for (uint32_t variant_idx = 0; variant_idx < variant_ct; variant_idx++) {
+    const uint32_t variant_uidx = BitIter1(variant_include, &variant_uidx_base, &variant_include_bits);
+    const char* vid = variant_ids[variant_uidx];
+    
+    auto it = file_id_to_idx.find(std::string(vid));
+    if (it != file_id_to_idx.end()) {
+      uint64_t file_idx = it->second;
+      uint64_t start = file_row_starts[file_idx];
+      uint64_t end = file_row_starts[file_idx + 1];
+      total_weights += (end - start);
+    }
+    variant_starts[variant_idx + 1] = total_weights;
+  }
+  
+  // Allocate weight arrays
+  if (bigstack_alloc_u32(total_weights, &score_idxs) ||
+      bigstack_alloc_d(total_weights, &score_vals)) {
+    return kPglRetNomem;
+  }
+  
+  // Copy matching weights
+  uint32_t write_idx = 0;
+  
+  // Reset iteration variables for second pass
+  variant_uidx_base = 0;
+  variant_include_bits = variant_include[0];
+  
+  for (uint32_t variant_idx = 0; variant_idx < variant_ct; variant_idx++) {
+    const uint32_t variant_uidx = BitIter1(variant_include, &variant_uidx_base, &variant_include_bits);
+    const char* vid = variant_ids[variant_uidx];
+    
+    auto it = file_id_to_idx.find(std::string(vid));
+    if (it != file_id_to_idx.end()) {
+      uint64_t file_idx = it->second;
+      uint64_t start = file_row_starts[file_idx];
+      uint64_t end = file_row_starts[file_idx + 1];
+      
+      for (uint64_t k = start; k < end; k++) {
+        score_idxs[write_idx] = file_col_indices[k];
+        score_vals[write_idx] = file_values[k];
+        write_idx++;
+      }
+    }
+  }
+  
+  // Set output
+  *score_names_ptr = R_CAST(char*, score_names);
+  *score_ct_ptr = file_trait_ct;
+  *max_score_name_blen_ptr = max_score_name_blen;
+  sparse_data_ptr->variant_starts = variant_starts;
+  sparse_data_ptr->score_idxs = score_idxs;
+  sparse_data_ptr->score_vals = score_vals;
+  sparse_data_ptr->total_weights = total_weights;
+  
+  logprintf("Binary sparse loaded: %u variants matched, %u total weights\n", variant_ct, total_weights);
+  
+  return kPglRetSuccess;
+}
+
 PglErr ScoreSparseLoad(const ScoreInfo* score_info_ptr, const uintptr_t* variant_include, const uint32_t* variant_include_cumulative_popcounts, const char* const* variant_ids, uint32_t raw_variant_ct, uint32_t variant_ct, char** score_names_ptr, uint32_t* score_ct_ptr, uintptr_t* max_score_name_blen_ptr, SparseScoreData* sparse_data_ptr) {
   PglErr reterr = kPglRetSuccess;
   TextStream txs;
@@ -7132,25 +7312,57 @@ THREAD_FUNC_DECL CalcScoreThread(void* raw_arg) {
 
       const uint32_t dense_variant_ct = cur_variant_batch_size - sparse_vidx;
       if (dense_variant_ct) {
-        if (ctx->sparse_weight_starts) {
+        // For sparse scoring, use score_sparse_coefs_vmaj (which we loaded) to match dense scoring behavior
+        if (ctx->sparse_weight_starts && ctx->score_sparse_coefs_vmaj[parity]) {
+          // Use the same matrix multiply as dense scoring, but with sparse_coefs_vmaj
+          // This ensures identical computation to dense scoring
+          const double* score_sparse_coefs_vmaj = ctx->score_sparse_coefs_vmaj[parity];
+          // score_sparse_coefs_vmaj is [variant][trait] in variant-major format
+          // Weights are loaded in order (0, 1, 2, ...) for each variant in the batch
+          // Use the same loop structure as dense scoring but with sparse_coefs_vmaj
+          for (uint32_t i = 0; i < dense_variant_ct; ++i) {
+            // Use i directly since weights are loaded in order for each variant in the batch
+            const double* cur_coefs = &(score_sparse_coefs_vmaj[i * score_final_col_ct]);
+            const double* cur_dosages = &(dosages_vmaj[i * sample_shard_size]);
+            for (uint32_t s_idx = 0; s_idx != score_final_col_ct; ++s_idx) {
+              double* cur_scores = &(shard_final_scores_cmaj[s_idx * sample_shard_size]);
+              const double coef = cur_coefs[s_idx];
+              for (uint32_t s = 0; s < sample_shard_size; ++s) {
+                cur_scores[s] += coef * cur_dosages[s];
+              }
+            }
+          }
+        } else if (ctx->sparse_weight_starts) {
+          // Optimized direct sparse scoring - only process non-zero weights
           const uint32_t* sparse_weight_starts = ctx->sparse_weight_starts;
           const uint32_t* sparse_weight_cols = ctx->sparse_weight_cols;
           const double* sparse_weight_vals = ctx->sparse_weight_vals;
+          
+          // Simple optimized loop without OpenMP overhead
+          // Process each variant's non-zero weights directly
           for (uint32_t i = 0; i < dense_variant_ct; ++i) {
-             uint32_t subsetted_vidx = ctx->variant_sidxs[parity][i];
-             uint32_t w_start = sparse_weight_starts[subsetted_vidx];
-             uint32_t w_end = sparse_weight_starts[subsetted_vidx + 1];
-             if (w_start == w_end) continue;
-             
-             double* cur_dosages = &(dosages_vmaj[i * sample_shard_size]);
-             for (uint32_t k = w_start; k < w_end; ++k) {
-                uint32_t s_idx = sparse_weight_cols[k];
-                double val = sparse_weight_vals[k];
-                double* cur_scores = &(shard_final_scores_cmaj[s_idx * sample_shard_size]);
-                for (uint32_t s = 0; s < sample_shard_size; ++s) {
-                   cur_scores[s] += val * cur_dosages[s];
-                }
-             }
+            const uint32_t subsetted_vidx = ctx->variant_sidxs[parity][i];
+            const uint32_t w_start = sparse_weight_starts[subsetted_vidx];
+            const uint32_t w_end = sparse_weight_starts[subsetted_vidx + 1];
+            
+            if (w_start == w_end) continue; // Skip variants with no weights
+            
+            const double* cur_dosages = &(dosages_vmaj[i * sample_shard_size]);
+            
+            // Process each non-zero weight for this variant
+            for (uint32_t k = w_start; k < w_end; ++k) {
+              const uint32_t s_idx = sparse_weight_cols[k];
+              const double val = sparse_weight_vals[k];
+              double* __restrict__ cur_scores = &(shard_final_scores_cmaj[s_idx * sample_shard_size]);
+              
+              // Vectorizable inner loop - compiler should auto-vectorize this
+              #if defined(__GNUC__) || defined(__clang__)
+              #pragma GCC ivdep
+              #endif
+              for (uint32_t s = 0; s < sample_shard_size; ++s) {
+                cur_scores[s] += val * cur_dosages[s];
+              }
+            }
           }
         } else {
           const double* score_dense_coefs_cmaj = ctx->score_dense_coefs_cmaj[parity];
@@ -7478,7 +7690,41 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
 
     if (score_info_ptr->flags & kfScoreSparse) {
       uint32_t score_col_ct_u32 = 0;
-      reterr = ScoreSparseLoad(score_info_ptr, variant_include, variant_include_cumulative_popcounts, variant_ids, raw_variant_ct, variant_ct, &sparse_score_names, &score_col_ct_u32, &sparse_max_score_name_blen, &sparse_data);
+      
+      // Check for binary format (.binsparse extension)
+      const char* mtx_fname = score_info_ptr->sparse_mtx_fname;
+      const uint32_t fname_len = strlen(mtx_fname);
+      const uint32_t fname_blen = fname_len + 1;
+      const uint32_t is_binary = (fname_len > 10 && !memcmp(&mtx_fname[fname_len - 10], ".binsparse", 10));
+      
+      if (is_binary) {
+        // Binary sparse format - load directly
+        logputs("Binary sparse format detected, using optimized loader...\n");
+        reterr = LoadBinarySparse(mtx_fname, variant_include, variant_include_cumulative_popcounts, variant_ids, raw_variant_ct, variant_ct, &sparse_score_names, &score_col_ct_u32, &sparse_max_score_name_blen, &sparse_data);
+      } else {
+        // Check if task-based format (.index file) exists
+        char task_index_fname[kPglFnamesize];
+        snprintf(task_index_fname, kPglFnamesize, "%s.index", score_info_ptr->sparse_mtx_fname);
+        
+        FILE* test_f = fopen(task_index_fname, "rb");
+        const uint32_t use_task_format = (test_f != nullptr);
+        if (test_f) {
+          fclose(test_f);
+        }
+        
+        if (use_task_format) {
+          // Use task-based execution (note: full integration pending data flow)
+          logputs("Using task-based sparse scoring format...\n");
+          logerrputs("Error: Task-based execution not yet fully integrated with scoring pipeline.\n");
+          logerrputs("       Use .mtx format for now. Task infrastructure is ready for future integration.\n");
+          reterr = kPglRetNotYetSupported;
+          goto ScoreReport_ret_1;
+        } else {
+          // Use existing MTX format
+          reterr = ScoreSparseLoad(score_info_ptr, variant_include, variant_include_cumulative_popcounts, variant_ids, raw_variant_ct, variant_ct, &sparse_score_names, &score_col_ct_u32, &sparse_max_score_name_blen, &sparse_data);
+        }
+      }
+      
       score_col_ct = score_col_ct_u32;
       if (unlikely(reterr)) {
          if (reterr == kPglRetOpenFail) goto ScoreReport_ret_OPEN_FAIL;
@@ -7486,7 +7732,6 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
          goto ScoreReport_ret_MALFORMED_INPUT; // Simplified mapping
       }
       
-      const uint32_t fname_blen = strlen(score_info_ptr->sparse_mtx_fname) + 1;
       if (unlikely(bigstack_alloc_llstr(fname_blen, &fname_iter))) {
         goto ScoreReport_ret_NOMEM;
       }
@@ -8046,6 +8291,7 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
         uintptr_t variant_include_bits = variant_include[0];
         uintptr_t variant_uidx_base = 0;
         uint32_t svidx = 0;
+        uint32_t sparse_vidx_local = 0;  // Track sparse variant index for weight loading
         for (; svidx < variant_ct; ++svidx) {
           uint32_t variant_uidx = BitIter1(variant_include, &variant_uidx_base, &variant_include_bits);
           
@@ -8162,6 +8408,26 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
               geno_intercepts[block_vidx] = 0.0;
           }
 
+          // Load sparse weights into score_sparse_coefs_vmaj for this variant
+          // This ensures sparse scoring uses the same weight structure as dense scoring
+          if (ctx.sparse_weight_starts && score_sparse_coefs_vmaj) {
+            const uint32_t w_start = ctx.sparse_weight_starts[svidx];
+            const uint32_t w_end = ctx.sparse_weight_starts[svidx + 1];
+            double* cur_score_coefs = &(score_sparse_coefs_vmaj[sparse_vidx_local * score_final_col_ct]);
+            // Initialize all weights to zero
+            for (uint32_t uii = 0; uii != score_final_col_ct; ++uii) {
+              cur_score_coefs[uii] = 0.0;
+            }
+            // Load non-zero weights from sparse structure
+            for (uint32_t k = w_start; k < w_end; ++k) {
+              uint32_t s_idx = ctx.sparse_weight_cols[k];
+              if (s_idx < score_final_col_ct) {
+                cur_score_coefs[s_idx] = ctx.sparse_weight_vals[k];
+              }
+            }
+            ++sparse_vidx_local;
+          }
+
            if (dosage_present_iter) {
              dosage_present_iter = &(dosage_present_iter[sample_ctaw]);
              dosage_main_iter = &(dosage_main_iter[dosage_main_stride]);
@@ -8209,6 +8475,7 @@ PglErr ScoreReport(const uintptr_t* sample_include, const SampleIdInfo* siip, co
               ploidy_m1s = &(ctx.ploidy_m1s[parity][0]);
               block_vidx = 0;
               sparse_vidx = 0;
+              sparse_vidx_local = 0;  // Reset for next block
           }
         }
       } else

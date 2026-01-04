@@ -6,7 +6,8 @@
 
 # Does not currently support -DCPU_CHECK_...
 
-BASEFLAGS=-flto -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD
+BASEFLAGS=-DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD -fopenmp -Wno-error
+# BASEFLAGS=-flto -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD
 # BASEFLAGS=-g -DZSTD_MULTITHREAD -DIGNORE_BUNDLED_ZSTD
 # BASEFLAGS=-flto -mavx2 -mbmi -mbmi2 -mfma -mlzcnt -DZSTD_MULTITHREAD
 # BASEFLAGS=-flto -msse4.2 -DZSTD_MULTITHREAD
@@ -26,13 +27,19 @@ ZLIB		?= -lz
 # replace OBJ with OBJ_NO_ZSTD below
 ZSTD		?=
 
+ifdef CONDA_PREFIX
+  CXXFLAGS += -I$(CONDA_PREFIX)/include
+  LDFLAGS += -L$(CONDA_PREFIX)/lib
+endif
+
+# Explicitly set OpenBLAS paths if CONDA PREFIX available  
 BLASFLAGS64	?= -llapack -lf77blas -latlas
 ARCH32		?=
 
 # Mandatory flags added to defaults or env settings
 CFLAGS		+= -std=gnu99 $(BASEFLAGS) $(CWARN) $(CINCLUDE)
 CXXFLAGS	+= -std=c++14 $(BASEFLAGS) $(CXXWARN) $(CXXINCLUDE)
-LDFLAGS		+= -lm -lpthread -flto $(ZLIB) $(ZSTD)
+LDFLAGS		+= -lm -lpthread -fopenmp $(ZLIB) $(ZSTD)
 
 # Installation defaults
 MKDIR		?= mkdir
